@@ -1,0 +1,169 @@
+name: Release
+
+# Stable release: on a version tag (e.g. v0.1.0) build every platform and publish them to a single
+# GitHub Release. Also runnable manually from the Actions tab (builds + uploads artifacts; only a
+# tag run creates the Release). Nightly builds live in nightly.yml.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# Required to create a Release and upload assets.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Build the platform matrix (macOS arm64/x64 + Linux + Windows x64) via the reusable workflow.
+  # secrets: inherit forwards the optional signing/notarization secrets. macOS is signed but NOT
+  # notarized here — notarization is decoupled into the notarize-mac job below.
+  build:
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+
+  # Notarize + staple the signed macOS artifacts on their own runner, then re-emit the stapled dmg/zip
+  # (overwriting the build's signed-only ones) so publish always attaches a stapled mac build. Kept out
+  # of the build matrix so a slow Apple notarization never holds up the platform builds; the job is
+  # time-capped and re-runnable (see notarize-mac.yml). No-ops when signing secrets aren't configured.
+  notarize-mac:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    uses: ./.github/workflows/notarize-mac.yml
+    secrets: inherit
+
+  # The reusable build already hard-gates a fresh NSIS install/start/uninstall. On stable tags, also
+  # install the latest published stable version and run the new installer over it. This runs beside
+  # macOS notarization, so its few minutes normally do not extend the release critical path.
+  windows-upgrade-smoke:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Download current Windows installer
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-x64
+          path: current
+
+      - name: Download previous stable Windows installer
+        id: previous
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURRENT_TAG: ${{ github.ref_name }}
+        run: |
+          New-Item -ItemType Directory -Force previous | Out-Null
+          $releases = gh release list --exclude-drafts --exclude-pre-releases --limit 20 --json tagName
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tag = ($releases | ConvertFrom-Json | Where-Object { $_.tagName -like 'v*' -and $_.tagName -ne $env:CURRENT_TAG } | Select-Object -First 1).tagName
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            "available=false" >> $env:GITHUB_OUTPUT
+            Write-Host "No previous stable release is available; fresh-install smoke already passed."
+            exit 0
+          }
+          gh release download $tag --pattern '*-win-x64-setup.exe' --dir previous
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "available=true" >> $env:GITHUB_OUTPUT
+
+      - name: Smoke test Windows upgrade
+        if: steps.previous.outputs.available == 'true'
+        run: >-
+          node scripts/windows-installer-smoke.mjs
+          --installer-dir current
+          --previous-installer-dir previous
+
+  # Collect every platform's artifacts and publish them to the tag's Release in one shot (a single
+  # publish job avoids the race of multiple build jobs writing the same Release). Depends on
+  # notarize-mac so the mac dmg/zip it downloads are the stapled versions.
+  publish:
+    needs: [build, notarize-mac, windows-upgrade-smoke]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    # Job-level permissions fully override the workflow-level block, so contents:write is restated
+    # alongside the two scopes the SLSA attestation needs: id-token to sign via Sigstore OIDC, and
+    # attestations to write the provenance record.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      # Checkout first (before downloading artifacts): the mac-feed merge step runs a repo script, and
+      # actions/checkout cleans the working dir, which would wipe a pre-downloaded artifacts/.
+      - name: Checkout (for the mac-feed merge script)
+        uses: actions/checkout@v7
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true # flatten every platform's files into one directory
+
+      # Merge the two per-arch mac feeds (from notarize-mac) into the single latest-mac.yml the
+      # installed app polls (default `latest` channel). No-ops if the mac feeds are absent.
+      - name: Merge mac update feed
+        run: node scripts/merge-mac-feed.mjs artifacts
+
+      # One SHA256SUMS.txt covering all installers so users can verify downloads.
+      - name: Generate checksums
+        working-directory: artifacts
+        run: |
+          shopt -s nullglob
+          files=(*.dmg *.zip *.exe *.AppImage *.deb)
+          if [ ${#files[@]} -gt 0 ]; then
+            sha256sum "${files[@]}" > SHA256SUMS.txt
+            cat SHA256SUMS.txt
+          fi
+
+      # Sign a SLSA build-provenance attestation for the exact installer bytes about to be published,
+      # so users can prove each download was built by this workflow from this commit (verify with
+      # `gh attestation verify <file> --repo <owner>/<repo>`). SHA256SUMS.txt is excluded — it's a
+      # digest list, not a build product. The attestation lives in the repo's Attestations, not as a
+      # Release asset, so it doesn't clutter the download list.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            artifacts/*.dmg
+            artifacts/*.zip
+            artifacts/*.exe
+            artifacts/*.AppImage
+            artifacts/*.deb
+
+      # Attach user-facing artifacts + checksums: installers (dmg/exe/AppImage/deb) and the mac
+      # portable zips, plus the electron-updater feed files so the mirror-to-website job can
+      # republish them to the CDN feed: win/linux latest.yml + latest-linux.yml, and the mac feeds.
+      # `*-mac.yml` covers the merged latest-mac.yml (the file the app polls) plus the per-arch
+      # arm64/x64-mac.yml intermediates it was built from. Blockmaps are win/linux only (mac does
+      # full-zip updates in v1).
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            artifacts/*.dmg
+            artifacts/*.zip
+            artifacts/*.exe
+            artifacts/*.AppImage
+            artifacts/*.deb
+            artifacts/SHA256SUMS.txt
+            artifacts/latest.yml
+            artifacts/latest-linux.yml
+            artifacts/*-mac.yml
+            artifacts/*.blockmap
